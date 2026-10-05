@@ -1,11 +1,17 @@
 """服务入口：将配额治理层挂载到 FastAPI。
 
-- 每个请求先经治理依赖：解析租户身份 -> 配额判定 -> 审计。
-- 拒绝响应使用可区分的状态码与 reason，超限携带 Retry-After。
-- 内部异常一律转为通用 500，不暴露堆栈或跨租户信息。
+- 启动时从环境变量加载配置并立即校验（非法配置直接启动失败）：
+  - QUOTA_DEFAULT_LIMIT / QUOTA_DEFAULT_WINDOW / QUOTA_DEFAULT_POLICY
+  - QUOTA_TENANT_OVERRIDES：JSON，如
+    {"tenant-vip": {"limit": 1000, "window_seconds": 60, "policy": "fail_open"}}
+- 每个请求先经治理层：身份校验 -> 配额判定 -> 审计（身份被拒也留审计）。
+- 拒绝响应使用可区分的状态码与 reason，超限/后端不可用携带 Retry-After。
+- 内部异常一律转为通用 503，不暴露堆栈或跨租户信息。
 """
 
+import json
 import logging
+import os
 import time
 
 import uvicorn
@@ -13,17 +19,38 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.audit import AuditRecorder
-from app.errors import QuotaGuardError, RejectReason
-from app.guard import DegradationPolicy, QuotaGuard
-from app.identity import parse_tenant_identity
+from app.config import DegradationPolicy, QuotaSettings, TenantQuotaRule
+from app.errors import RejectReason
+from app.guard import QuotaGuard
 from app.quota import QuotaCounter
 
 logging.basicConfig(level=logging.INFO)
 
-# 每租户每 60 秒窗口最多 100 次请求；计数后端故障时默认拒绝（fail-closed）。
-quota_counter = QuotaCounter(limit=100, window_seconds=60.0)
+
+def load_settings() -> QuotaSettings:
+    """从环境变量加载配置；任何非法值在此直接抛错，服务启动即失败。"""
+    overrides_raw = os.environ.get("QUOTA_TENANT_OVERRIDES", "{}")
+    overrides = {
+        tenant_id: TenantQuotaRule(
+            limit=int(rule["limit"]),
+            window_seconds=float(rule["window_seconds"]),
+            policy=DegradationPolicy(rule["policy"]) if rule.get("policy") else None,
+        )
+        for tenant_id, rule in json.loads(overrides_raw).items()
+    }
+    return QuotaSettings(
+        default_limit=int(os.environ.get("QUOTA_DEFAULT_LIMIT", "100")),
+        default_window_seconds=float(os.environ.get("QUOTA_DEFAULT_WINDOW", "60")),
+        default_policy=DegradationPolicy(os.environ.get("QUOTA_DEFAULT_POLICY", "fail_closed")),
+        tenant_overrides=overrides,
+    )
+
+
+# 默认每租户每 60 秒 100 次请求；计数后端故障时默认拒绝（fail-closed）。
+quota_settings = load_settings()
+quota_counter = QuotaCounter(settings=quota_settings)
 audit_recorder = AuditRecorder()
-quota_guard = QuotaGuard(quota_counter, audit_recorder, policy=DegradationPolicy.FAIL_CLOSED)
+quota_guard = QuotaGuard(quota_counter, audit_recorder, settings=quota_settings)
 
 app = FastAPI()
 
@@ -53,12 +80,9 @@ async def quota_guard_middleware(request: Request, call_next):
         return await call_next(request)
 
     try:
-        identity = parse_tenant_identity(dict(request.headers), dict(request.query_params))
-    except QuotaGuardError as exc:
-        return _reject(_REASON_STATUS[exc.reason], exc.reason.value)
-
-    try:
-        decision = quota_guard.check(identity, now=time.time())
+        decision = quota_guard.check_request(
+            dict(request.headers), dict(request.query_params), now=time.time()
+        )
     except Exception:
         # 兜底：内部异常不外泄，按 fail-closed 拒绝。
         logging.getLogger("quota_guard").exception("unexpected guard failure")

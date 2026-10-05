@@ -14,7 +14,8 @@ TENANT_HEADER = "x-tenant-id"
 TENANT_QUERY_PARAM = "tenant_id"
 
 # 租户 ID 格式：字母开头，仅含小写字母、数字、中划线，长度 3~32。
-_TENANT_PATTERN = re.compile(r"^[a-z][a-z0-9-]{2,31}$")
+TENANT_PATTERN = re.compile(r"^[a-z][a-z0-9-]{2,31}$")
+_TENANT_PATTERN = TENANT_PATTERN
 
 
 @dataclass(frozen=True)

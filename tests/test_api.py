@@ -87,3 +87,100 @@ def test_concurrent_multi_tenant_burst(client):
         print(f"\n[api] burst tenant={tenant} -> ok={ok} rejected={rejected}")
         assert ok == 5
         assert rejected == 5
+
+
+# ---- 新增行为：按租户配置、身份拒绝审计、后端故障降级响应 ----
+
+from app.config import QuotaSettings, TenantQuotaRule
+from app.guard import UNKNOWN_TENANT_KEY
+
+
+@pytest.fixture()
+def tenant_client():
+    """带按租户覆盖配置的治理实例：tenant-vip 上限 2 次 / 10 秒窗口。"""
+    settings = QuotaSettings(
+        default_limit=5,
+        default_window_seconds=60.0,
+        default_policy=DegradationPolicy.FAIL_CLOSED,
+        tenant_overrides={"tenant-vip": TenantQuotaRule(limit=2, window_seconds=10.0)},
+    )
+    main.quota_settings = settings
+    main.quota_counter = QuotaCounter(settings=settings)
+    main.audit_recorder = AuditRecorder()
+    main.quota_guard = QuotaGuard(main.quota_counter, main.audit_recorder, settings=settings)
+    return TestClient(main.app)
+
+
+def test_per_tenant_limit_overrides_default(tenant_client):
+    # tenant-vip 用自己的上限 2：第 3 次即 429。
+    assert tenant_client.get("/", headers={"x-tenant-id": "tenant-vip"}).status_code == 200
+    assert tenant_client.get("/", headers={"x-tenant-id": "tenant-vip"}).status_code == 200
+    vip = tenant_client.get("/", headers={"x-tenant-id": "tenant-vip"})
+    _show("vip_override_limit", vip)
+    assert vip.status_code == 429
+
+    # 默认租户不受覆盖影响，也不受 vip 计数影响。
+    for _ in range(5):
+        assert tenant_client.get("/", headers={"x-tenant-id": "tenant-a"}).status_code == 200
+    plain = tenant_client.get("/", headers={"x-tenant-id": "tenant-a"})
+    _show("default_limit", plain)
+    assert plain.status_code == 429
+
+
+def test_identity_rejection_is_audited(tenant_client):
+    resp = tenant_client.get("/")
+    _show("missing_audited", resp)
+    assert resp.status_code == 401
+    records = main.audit_recorder.records_for(UNKNOWN_TENANT_KEY)
+    for r in records:
+        print(f"[audit] {r}")
+    assert [r.reason for r in records] == ["tenant_missing"]
+    # 审计按归属键隔离：其他租户桶里没有这条记录。
+    assert main.audit_recorder.records_for("tenant-a") == []
+
+
+def test_backend_failure_fail_closed_503_with_retry_hint(tenant_client):
+    class _Down:
+        def try_acquire(self, tenant_id, now):
+            raise TimeoutError("backend read timed out")
+
+    main.quota_guard = QuotaGuard(_Down(), main.audit_recorder, settings=main.quota_settings)
+    resp = tenant_client.get("/", headers={"x-tenant-id": "tenant-a"})
+    _show("backend_timeout_fail_closed", resp)
+    assert resp.status_code == 503
+    assert resp.json()["error"]["reason"] == "quota_unavailable"
+    # 拒绝携带重试提示，响应头与响应体一致。
+    assert resp.json()["error"]["retry_after"] == 60.0
+    assert "Retry-After" in resp.headers
+    # 判定依据已审计。
+    record = main.audit_recorder.records_for("tenant-a")[0]
+    print(f"[audit] {record}")
+    assert record.decision == "rejected" and record.reason == "quota_unavailable"
+
+
+def test_backend_failure_fail_open_per_tenant(tenant_client):
+    class _Down:
+        def try_acquire(self, tenant_id, now):
+            raise ConnectionError("connection refused")
+
+    main.quota_guard = QuotaGuard(_Down(), main.audit_recorder, settings=main.quota_settings)
+    # tenant-vip 未单独配置策略时走默认 fail_closed；这里给它换 fail_open 配置再验。
+    settings = QuotaSettings(
+        default_limit=5,
+        default_window_seconds=60.0,
+        default_policy=DegradationPolicy.FAIL_CLOSED,
+        tenant_overrides={"tenant-vip": TenantQuotaRule(
+            limit=2, window_seconds=10.0, policy=DegradationPolicy.FAIL_OPEN)},
+    )
+    main.quota_guard = QuotaGuard(_Down(), main.audit_recorder, settings=settings)
+
+    vip = tenant_client.get("/", headers={"x-tenant-id": "tenant-vip"})
+    plain = tenant_client.get("/", headers={"x-tenant-id": "tenant-a"})
+    _show("vip_fail_open", vip)
+    _show("plain_fail_closed", plain)
+    assert vip.status_code == 200
+    assert vip.headers["X-Quota-Degraded"] == "true"
+    assert plain.status_code == 503
+    # 对外结果与各自策略语义一致，且都有审计依据。
+    assert main.audit_recorder.records_for("tenant-vip")[0].reason == "degraded_fail_open"
+    assert main.audit_recorder.records_for("tenant-a")[0].reason == "quota_unavailable"
