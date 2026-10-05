@@ -87,3 +87,91 @@ def test_concurrent_multi_tenant_burst(client):
         print(f"\n[api] burst tenant={tenant} -> ok={ok} rejected={rejected}")
         assert ok == 5
         assert rejected == 5
+
+
+@pytest.fixture()
+def client_with_overrides():
+    # 带租户覆盖与显式降级配置的治理实例。
+    from app.config import DegradationPolicy, GuardConfig, TenantQuotaConfig
+
+    main.guard_config = GuardConfig(
+        default_limit=5,
+        default_window_seconds=60.0,
+        default_policy=DegradationPolicy.FAIL_CLOSED,
+        unavailable_retry_after=3.0,
+        tenant_overrides={
+            "tenant-vip": TenantQuotaConfig(limit=8, window_seconds=60.0),
+        },
+    )
+    main.quota_counter = QuotaCounter(
+        limit=main.guard_config.default_limit,
+        window_seconds=main.guard_config.default_window_seconds,
+        tenant_overrides=main.guard_config.tenant_overrides,
+    )
+    main.audit_recorder = AuditRecorder()
+    main.quota_guard = QuotaGuard(
+        main.quota_counter, main.audit_recorder, config=main.guard_config
+    )
+    return TestClient(main.app)
+
+
+def test_per_tenant_limit_over_http(client_with_overrides):
+    client = client_with_overrides
+    # 默认租户上限 5，vip 租户上限 8。
+    for _ in range(5):
+        assert client.get("/", headers={"x-tenant-id": "tenant-a"}).status_code == 200
+    resp_default = client.get("/", headers={"x-tenant-id": "tenant-a"})
+    _show("default_limit_5", resp_default)
+    assert resp_default.status_code == 429
+
+    for i in range(8):
+        resp = client.get("/", headers={"x-tenant-id": "tenant-vip"})
+        assert resp.status_code == 200, f"vip req#{i} unexpectedly {resp.status_code}"
+    resp_vip = client.get("/", headers={"x-tenant-id": "tenant-vip"})
+    _show("vip_limit_8", resp_vip)
+    assert resp_vip.status_code == 429
+
+
+def test_identity_rejections_are_audited(client_with_overrides):
+    client = client_with_overrides
+    resp_missing = client.get("/")
+    resp_invalid = client.get("/", headers={"x-tenant-id": "!!bad!!"})
+    resp_conflict = client.get("/", headers={"x-tenant-id": "tenant-a"},
+                               params={"tenant_id": "tenant-b"})
+    _show("missing", resp_missing)
+    _show("invalid", resp_invalid)
+    _show("conflict", resp_conflict)
+    assert (resp_missing.status_code, resp_invalid.status_code,
+            resp_conflict.status_code) == (401, 400, 409)
+
+    from app.guard import UNIDENTIFIED_TENANT
+    unidentified = main.audit_recorder.records_for(UNIDENTIFIED_TENANT)
+    a_records = main.audit_recorder.records_for("tenant-a")
+    b_records = main.audit_recorder.records_for("tenant-b")
+    for r in unidentified + a_records + b_records:
+        print(f"[audit] {r}")
+    # 缺失与非法格式都归入保留键；冲突在两个候选租户下各自留痕。
+    assert [r.reason for r in unidentified] == ["tenant_missing", "tenant_invalid"]
+    assert [r.reason for r in a_records] == ["tenant_conflict"]
+    assert [r.reason for r in b_records] == ["tenant_conflict"]
+    # 隔离：未涉及的租户无任何记录。
+    assert main.audit_recorder.records_for("tenant-c") == []
+
+
+def test_backend_failure_503_with_retry_hint(client_with_overrides):
+    client = client_with_overrides
+
+    class _Down:
+        def try_acquire(self, tenant_id, now):
+            raise ConnectionError("connection refused")
+
+    main.quota_guard = QuotaGuard(_Down(), main.audit_recorder, config=main.guard_config)
+    resp = client.get("/", headers={"x-tenant-id": "tenant-a"})
+    _show("backend_down_fail_closed", resp)
+    assert resp.status_code == 503
+    assert resp.json()["error"]["reason"] == "quota_unavailable"
+    assert resp.headers["Retry-After"] == "3"  # unavailable_retry_after=3.0
+    # 拒绝依据已留痕。
+    records = main.audit_recorder.records_for("tenant-a")
+    print(f"[audit] {records[0]}")
+    assert records[0].reason == "quota_unavailable"

@@ -14,7 +14,8 @@ TENANT_HEADER = "x-tenant-id"
 TENANT_QUERY_PARAM = "tenant_id"
 
 # 租户 ID 格式：字母开头，仅含小写字母、数字、中划线，长度 3~32。
-_TENANT_PATTERN = re.compile(r"^[a-z][a-z0-9-]{2,31}$")
+TENANT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{2,31}$")
+_TENANT_PATTERN = TENANT_ID_PATTERN
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,23 @@ def _validate_format(raw: str) -> str:
             "tenant id format is invalid",
         )
     return value
+
+
+def tenant_candidates(headers: dict[str, str], query_params: dict[str, str]) -> list[str]:
+    """从请求中提取所有格式合法的租户 ID 候选（去重，保持来源顺序）。
+
+    用于身份校验失败时的审计留痕：只返回能通过格式校验的值，
+    非法输入不会产生候选。
+    """
+    lowered = {k.lower(): v for k, v in headers.items()}
+    candidates: list[str] = []
+    for raw in (lowered.get(TENANT_HEADER), query_params.get(TENANT_QUERY_PARAM)):
+        if raw is None:
+            continue
+        value = raw.strip()
+        if TENANT_ID_PATTERN.match(value) and value not in candidates:
+            candidates.append(value)
+    return candidates
 
 
 def parse_tenant_identity(headers: dict[str, str], query_params: dict[str, str]) -> TenantIdentity:
